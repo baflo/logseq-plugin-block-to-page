@@ -84,6 +84,23 @@ async function main(blockId: string) {
       await logseq.Editor.removeBlock(targetBlock.uuid);
     }
 
+    // Find remaining references logseq infers from the content and move them to the "tags::" property of the page
+    if (logseq.settings?.createPageTags && pageBlock && srcBlock.refs) {
+      const page = await logseq.Editor.getPage(pageName);
+      const pageProps = page?.["properties"] || {};
+
+      const contentPageRefs = await Promise.all(srcBlock.refs.map(ref => logseq.Editor.getPage(ref.id)));
+      const tags: string[] = contentPageRefs
+          .map(pageRef => pageRef.name)
+          .filter((value, index, target) => index === target.indexOf(value));
+
+      const props = mergeObjects({}, pageProps, { tags });
+      const propsString = Object.entries(props).map(([key, value]) => `${key}:: ${value}`).join(`\n`);
+
+      // updateBlock seems to be the only way to simultaneously update the database (so queries update immediately)
+      await logseq.Editor.updateBlock(pageBlock.uuid, propsString);
+    }
+
     if (newBlockContent) {
       await logseq.Editor.updateBlock(srcBlock.uuid, newBlockContent);
     }
@@ -129,6 +146,13 @@ logseq
         key: "moveBlockPropertiesToPage",
         title: "Move block properties to page",
         description: "Move the block properties to page properties",
+        type: "boolean",
+        default: false,
+      },
+      {
+        key: "createPageTags",
+        title: "Create page tags for references",
+        description: "Create page tags for references in the block text",
         type: "boolean",
         default: false,
       },

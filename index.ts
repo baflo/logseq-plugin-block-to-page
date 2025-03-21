@@ -1,5 +1,6 @@
 import "@logseq/libs";
-import { BlockEntity } from "@logseq/libs/dist/LSPlugin.user";
+import { BlockEntity, PageEntity } from "@logseq/libs/dist/LSPlugin.user";
+import { formatPropertiesString, getPropertiesFromBlockContent, mergeObjects, removeProperties } from "./util";
 
 async function main(blockId: string) {
   const srcBlock = await logseq.Editor.getBlock(blockId, {
@@ -10,33 +11,47 @@ async function main(blockId: string) {
   }
 
   const pageRegx = /^\[\[(.*)\]\]$/;
-  const firstLine = srcBlock.content.split("\n")[0].trim();
+  const allLines = srcBlock.content.split("\n");
+  const firstLine = allLines[0].trim();
   const pageName = firstLine.replace(pageRegx, "$1");
 
   await createPageIfNotExist(pageName);
-  const [firstBlock, lastBlock] = await getFirstAndLastBlock(pageName) ?? [null, null]
+  const [firstBlock, lastBlock] = await getFirstAndLastBlock(pageName) ?? []
+  let pageBlock: BlockEntity | null = null;
 
-  // Move block properties to page properties
-  if (logseq.settings?.moveBlockPropertiesToPage) {
-    const pageBlock = firstBlock?.["preBlock?"]
+  // Prepare a page block if necessary
+  if (logseq.settings?.moveBlockPropertiesToPage || logseq.settings?.createPageTags) {
+    pageBlock = firstBlock?.["preBlock?"]
       ? firstBlock // first block is a page properties block
       : await logseq.Editor.insertBlock(firstBlock ? firstBlock.uuid : pageName, "", { isPageBlock: true, before: true });
+  }
 
-    if (pageBlock) {
-      // Get props from block content, because the one in the object properties are renamed, e.g. fix-issue -> fixissue, and we need the originals
-      const blockProps = getPropertiesFromBlockContent(srcBlock);
-      const pageProps = getPropertiesFromBlockContent(pageBlock);
+  // Move block properties to page properties
+  if (logseq.settings?.moveBlockPropertiesToPage && pageBlock) {
+    // Get props from block content, because the one in the object properties are renamed, e.g. fix-issue -> fixissue, and we need the originals
+    const propsCount = srcBlock?.propertiesOrder.length ?? 0;
+    const blockProps = getPropertiesFromBlockContent(srcBlock);
+    const pageProps = getPropertiesFromBlockContent(pageBlock);
 
-      const props = Object.assign({}, pageProps, blockProps);
-      const propsString = Object.entries(props).map(([key, value]) => `${key}:: ${value}`).join(`\n`);
+    const newPageProperties = mergeObjects(mergeObjects({}, pageProps), blockProps);
+    const newPagePropertiesString = formatPropertiesString(newPageProperties);
 
-      // updateBlock seems to be the only way to simultaneously update the database (so queries update immediately)
-      await logseq.Editor.updateBlock(pageBlock.uuid, propsString);
-      await Promise.all(Object.keys(blockProps).map(prop => logseq.Editor.removeBlockProperty(srcBlock.uuid, prop)));
+    // updateBlock seems to be the only way to simultaneously update the database (so queries update immediately)
+    await logseq.Editor.updateBlock(pageBlock.uuid, newPagePropertiesString);
+    await logseq.Editor.updateBlock(srcBlock.uuid, removeProperties(allLines).join("\n"));
 
-      // Update properties in local source block object
-      Object.assign(srcBlock, await logseq.Editor.getBlock(blockId, { includeChildren: true }));
-    }
+    do {
+      const updatedSrcBlock = await logseq.Editor.getBlock(srcBlock.uuid, { includeChildren: true });
+
+      // Wait until properties are removed from references of the block
+      if ((updatedSrcBlock?.refs.length ?? 0) <= srcBlock.refs.length - propsCount) {
+        // Update properties in local source block object
+        Object.assign(srcBlock, updatedSrcBlock);
+        break;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (true);
   }
 
   let newBlockContent = "";
@@ -71,10 +86,9 @@ async function main(blockId: string) {
 
     if (newBlockContent) {
       await logseq.Editor.updateBlock(srcBlock.uuid, newBlockContent);
-      // properties param not working...
-      // and then remove block property will undo updateBlock...
     }
-    await logseq.Editor.exitEditingMode();
+
+    await logseq.Editor.exitEditingMode(true);
 
     if (srcBlock.properties?.collapsed) {
       await logseq.Editor.removeBlockProperty(srcBlock.uuid, "collapsed");
@@ -128,11 +142,6 @@ logseq
     });
   })
   .catch(console.error);
-
-function getPropertiesFromBlockContent(srcBlock: BlockEntity) {
-  const propsRegexp = /^([^:\n]+)::\S*([^\n]*?)$/gm;
-  return Object.fromEntries(Array.from(srcBlock.content.matchAll(propsRegexp)).map(([m, key, value]) => [key, value]));
-}
 
 async function createPageIfNotExist(pageName: string) {
   let page = await logseq.Editor.getPage(pageName);
